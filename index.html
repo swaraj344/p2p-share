@@ -259,9 +259,12 @@
 (function(){
   "use strict";
 
-  const PAYLOAD_CHUNK = 16 * 1024;      // 16KB payload per binary message (+1 byte slot header)
-  const HIGH_WATER = 2 * 1024 * 1024;   // pause sending above this buffered amount
-  const LOW_WATER  = 512 * 1024;        // resume sending below this
+  const PAYLOAD_CHUNK_WAN = 16 * 1024;        // 16KB payload — safe default for internet/different networks
+  const PAYLOAD_CHUNK_LAN = 256 * 1024;       // 256KB payload — used when both devices are on the same network
+  const HIGH_WATER_WAN = 2 * 1024 * 1024;     // pause sending above this buffered amount
+  const LOW_WATER_WAN  = 512 * 1024;          // resume sending below this
+  const HIGH_WATER_LAN = 8 * 1024 * 1024;
+  const LOW_WATER_LAN  = 2 * 1024 * 1024;
   const THUMB_MAX_DIM = 96;
 
   const $ = sel => document.querySelector(sel);
@@ -422,6 +425,7 @@
       activeSlotCount = 0;
       freeSlots.length = 0;
       nextSlotId = 0;
+      cancelledIds.clear();
       myQueue.forEach(it=>{ if(it.sendStatus !== 'idle') it.sendStatus = 'idle'; });
       renderMyQueue();
       conn = null; sameNetwork = null;
@@ -491,6 +495,7 @@
         <div class="item-sub">${item.sendStatus === 'idle' ? (conn && conn.open ? 'offered' : 'queued') : escapeHtml(item.sendStatus)}</div>
       `;
       el.querySelector('.item-remove').onclick = ()=>{
+        if(item.sendStatus && item.sendStatus.startsWith('sending')) cancelledIds.add(item.id);
         myQueue = myQueue.filter(q=>q.id!==item.id);
         renderMyQueue();
         if(conn && conn.open) sendOffer();
@@ -524,6 +529,7 @@
   const parallelSelect = $('#parallelSelect');
   let theirItems = {}; // id -> {meta, status, received, chunks, writer, el, startTime}
   let slotMap = {};    // slot -> item id (receiver side)
+  let cancelledIds = new Set(); // ids the receiver has cancelled — sender checks this mid-transfer
 
   function handleData(data){
     const isBinary = (data instanceof ArrayBuffer) || ArrayBuffer.isView(data);
@@ -533,6 +539,7 @@
     if(data.type === 'request') return handleRequest(data.ids);
     if(data.type === 'start') return handleStart(data.id, data.slot);
     if(data.type === 'itemdone') return handleItemDone(data.id);
+    if(data.type === 'cancel') return handleCancel(data.id);
   }
 
   function handleOffer(items){
@@ -608,6 +615,12 @@
         btn.textContent = 'Download';
         btn.onclick = ()=> requestItems([id]);
         el.appendChild(btn);
+      } else if(rec.status === 'requested' || rec.status === 'receiving'){
+        const btn = document.createElement('button');
+        btn.className = 'action-btn';
+        btn.textContent = 'Cancel';
+        btn.onclick = ()=> cancelDownload(id);
+        el.appendChild(btn);
       } else if(rec.status === 'done' && rec.objectUrl){
         if(isImageMime(meta.mime)){
           const viewBtn = document.createElement('button');
@@ -656,13 +669,25 @@
     renderTheirQueue();
   }
 
+  function cancelDownload(id){
+    const rec = theirItems[id];
+    if(!rec || !conn || !conn.open) return;
+    conn.send({ type:'cancel', id });
+    if(rec.writer){ try{ rec.writer.abort(); }catch(e){} rec.writer = null; }
+    rec.status = 'available';
+    rec.received = 0;
+    rec.chunks = [];
+    renderTheirQueue();
+    log('cancelled download of ' + rec.meta.name, 'warn');
+  }
+
   async function handleBinaryChunk(buf){
     const view = new Uint8Array(buf);
     const slot = view[0];
     const payload = view.subarray(1);
     const id = slotMap[slot];
     const rec = id && theirItems[id];
-    if(!rec) return;
+    if(!rec || rec.status !== 'receiving') return; // ignore stray chunks after a cancel
     rec.received += payload.byteLength;
     if(rec.writer){
       try{ await rec.writer.write(payload); }
@@ -702,6 +727,18 @@
   function acquireSlot(){ return freeSlots.length ? freeSlots.pop() : nextSlotId++; }
   function releaseSlot(s){ freeSlots.push(s); }
 
+  function handleCancel(id){
+    cancelledIds.add(id);
+    pendingSendQueue = pendingSendQueue.filter(it=> it.id !== id);
+    const item = myQueue.find(q=>q.id===id);
+    if(item && !(item.sendStatus && item.sendStatus.startsWith('sending'))){
+      item.sendStatus = 'idle'; // wasn't actively sending — nothing more to stop
+      cancelledIds.delete(id);
+    }
+    renderMyQueue();
+    log('peer cancelled ' + (item ? item.name : id), 'warn');
+  }
+
   function handleRequest(ids){
     ids.forEach(id=>{
       const item = myQueue.find(q=>q.id===id);
@@ -733,16 +770,20 @@
       item.sendStatus = 'sending 0%';
       renderMyQueue();
       conn.send({ type:'start', id:item.id, slot });
+      log((sameNetwork === true ? 'same network — using large chunks for ' : 'sending ') + item.name);
 
       const file = item.file;
       let offset = 0;
       const startTime = Date.now();
+      const chunkSize = sameNetwork === true ? PAYLOAD_CHUNK_LAN : PAYLOAD_CHUNK_WAN;
+      const highWater = sameNetwork === true ? HIGH_WATER_LAN : HIGH_WATER_WAN;
+      const lowWater  = sameNetwork === true ? LOW_WATER_LAN  : LOW_WATER_WAN;
 
       function waitForBuffer(){
         const dc = conn.dataChannel;
-        if(!dc || dc.bufferedAmount < HIGH_WATER) return Promise.resolve();
+        if(!dc || dc.bufferedAmount < highWater) return Promise.resolve();
         return new Promise(res=>{
-          const check = ()=>{ if(!dc || dc.bufferedAmount < LOW_WATER) res(); else setTimeout(check, 30); };
+          const check = ()=>{ if(!dc || dc.bufferedAmount < lowWater) res(); else setTimeout(check, 30); };
           check();
         });
       }
@@ -751,12 +792,21 @@
           const reader = new FileReader();
           reader.onload = ()=> res(reader.result);
           reader.onerror = ()=> rej(reader.error);
-          reader.readAsArrayBuffer(file.slice(start, start + PAYLOAD_CHUNK));
+          reader.readAsArrayBuffer(file.slice(start, start + chunkSize));
         });
       }
 
       try{
         while(offset < file.size){
+          if(cancelledIds.has(item.id)){
+            cancelledIds.delete(item.id);
+            item.sendStatus = 'idle';
+            if(item.el){ item.el.classList.remove('done','error'); }
+            log('cancelled sending ' + item.name, 'warn');
+            renderMyQueue();
+            resolve();
+            return;
+          }
           await waitForBuffer();
           const payload = await readSlice(offset);
           const out = new Uint8Array(payload.byteLength + 1);
