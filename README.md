@@ -35,6 +35,14 @@ ever touches a server.
    alongside the metadata — no need to download the full file to see what
    it is). After an image is fully received, tap **View** to see it full
    size in an in-page preview, or **Save** to download it.
+7. **Cancel a download in progress.** Any item that's "waiting" or actively
+   "receiving" shows a **Cancel** button instead of a progress bar action.
+   Cancelling tells the sender to actually stop streaming that file's bytes
+   (it's not just hiding it on your screen) — the item goes back to
+   "available" so you can re-download it later if you want. If you'd
+   started a partial save-to-disk via the File System Access API, that
+   partial file write is aborted too. Removing an item you're actively
+   *sending* from "Your items" stops that transfer the same way.
 
 ## Why there's still one external service involved
 
