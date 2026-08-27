@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://share.swarajk.me/sitemap.xml
